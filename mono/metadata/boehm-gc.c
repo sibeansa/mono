@@ -44,8 +44,8 @@
 #define GC_dirty(x)
 #endif
 
-#undef TRUE
-#undef FALSE
+//#undef TRUE
+//#undef FALSE
 #define THREAD_LOCAL_ALLOC 1
 #include "private/pthread_support.h"
 
@@ -113,6 +113,90 @@ mono_gc_warning (char *msg, GC_word arg)
 
 static void on_gc_notification (GC_EventType event);
 static void on_gc_heap_resize (size_t new_size);
+
+#define ELEMENT_CHUNK_SIZE 128
+#define VECTOR_PROC_INDEX 6
+
+STATIC mse * GC_gcj_vector_proc (word * addr, mse * mark_stack_ptr,
+	mse * mark_stack_limit, word env)
+{
+	MonoArray* a = NULL;
+	if (env)
+	{
+		g_assert (env == 1);
+
+		a = (MonoArray*)GC_base (addr);
+	} else {
+		g_assert (addr == GC_base (addr));
+
+		a = (MonoArray*)addr;
+	}
+
+	if (!a->max_length)
+		return mark_stack_ptr;
+
+	mono_array_size_t length = a->max_length;
+	MonoClass* array_type = a->obj.vtable->klass;
+	MonoClass* element_type = a->obj.vtable->klass->element_class;
+	GC_descr element_desc = element_type->gc_descr;
+	g_assert ((element_desc & GC_DS_TAGS) == GC_DS_BITMAP);
+
+	/* create new descriptor that is shifted two bits to account 
+	 * for lack of object header. Descriptors for value types include
+	 * the object header for boxed values */
+
+	/* remove tags */
+	GC_descr element_desc_shifted = element_desc & ~(GC_DS_TAGS);
+	/* shift actual bits */
+	element_desc_shifted = element_desc_shifted << 2;
+	/* add back tag to indicate descriptor is a bitmap */
+	element_desc_shifted |= GC_DS_BITMAP;
+
+	int words_per_element = array_type->sizes.element_size / BYTES_PER_WORD;
+
+	g_assert (element_type->valuetype);
+	g_assert (GC_is_marked (a));
+
+#if 0
+	char buf[2048];
+	sprintf (buf, "M %p %s %d %d\n", addr, a->obj.vtable->klass->name, MONO_SIZEOF_MONO_ARRAY + length * array_type->sizes.element_size, a->max_length);
+	OutputDebugStringA (buf);
+#endif
+
+	/* start at first element or resume from last iteration */
+	word* start = env ? addr : (word*)a->vector;
+	/* end at last element or max chunk size */
+	word* actual_end = (word*)a->vector + length * words_per_element;
+	ptrdiff_t remaining_elements = (actual_end - start) / words_per_element;
+
+	word* end = actual_end;
+
+	if (remaining_elements > ELEMENT_CHUNK_SIZE) {
+		mark_stack_ptr++;
+		mark_stack_ptr->mse_descr.w = GC_MAKE_PROC (VECTOR_PROC_INDEX, 1 /* continue processing */);
+		mark_stack_ptr->mse_start = (ptr_t)(start + ELEMENT_CHUNK_SIZE * words_per_element);
+
+		/* only process chunk number of items */
+		end = start + ELEMENT_CHUNK_SIZE * words_per_element;
+	}
+	for (word* element = start; element < end; element += words_per_element) {
+		mark_stack_ptr++;
+		//if ((word)mark_stack_ptr >= (word)mark_stack_limit) {
+		//	mark_stack_ptr = GC_signal_mark_stack_overflow (mark_stack_ptr);
+		//	break;
+		//}
+
+		/* subtract two pointers to simulate object header in value types 
+		 * the descriptor bitmap is for a boxed value type */
+		//mark_stack_ptr->mse_start = (ptr_t)(element - 2);
+		//mark_stack_ptr->mse_descr.w = element_desc;
+
+		mark_stack_ptr->mse_start = (ptr_t)(element);
+		mark_stack_ptr->mse_descr.w = element_desc_shifted;
+	}
+
+	return(mark_stack_ptr);
+}
 
 void
 mono_gc_base_init (void)
@@ -219,6 +303,7 @@ mono_gc_base_init (void)
 	GC_finalizer_notifier = mono_gc_finalize_notify;
 
 	GC_init_gcj_malloc (5, NULL);
+	GC_init_gcj_vector (VECTOR_PROC_INDEX, GC_gcj_vector_proc);
 	GC_allow_register_threads ();
 
 	params_opts = mono_gc_params_get();
@@ -775,7 +860,19 @@ mono_gc_make_descr_for_object (gsize *bitmap, int numbits, size_t obj_size)
 void*
 mono_gc_make_descr_for_array (int vector, gsize *elem_bitmap, int numbits, size_t elem_size)
 {
-	/* libgc has no usable support for arrays... */
+	///* libgc has no usable support for arrays... */
+	if (!vector)
+		return GC_NO_DESCRIPTOR;
+
+	if (elem_size <= sizeof(void*))
+		return GC_NO_DESCRIPTOR;
+
+
+	///* It seems there are issues when the bitmap doesn't fit: play it safe */
+	//if (numbits >= 30 || elem_size % 4 != 0)
+	//	return GC_NO_DESCRIPTOR;
+	//else
+	//	return (gpointer)GC_make_descriptor ((GC_bitmap)elem_bitmap, numbits);
 	return GC_NO_DESCRIPTOR;
 }
 
@@ -862,10 +959,20 @@ mono_gc_alloc_vector (MonoVTable *vtable, size_t size, uintptr_t max_length)
 		obj->obj.synchronisation = NULL;
 
 		memset ((char *) obj + sizeof (MonoObject), 0, size - sizeof (MonoObject));
-	} else if (vtable->gc_descr != GC_NO_DESCRIPTOR) {
-		obj = (MonoArray *)GC_GCJ_MALLOC (size, vtable);
+#if 1
+	} else if (/*vtable->gc_descr != GC_NO_DESCRIPTOR*/
+		vtable->klass->element_class->valuetype && 
+		vtable->klass->element_class->gc_descr != GC_NO_DESCRIPTOR &&
+		vtable->domain == mono_get_root_domain ()) {
+		obj = (MonoArray *)GC_gcj_vector_malloc (size, vtable);
+#if 0
+		char buf[2048];
+		sprintf (buf , "A %p %s %d %d\n", obj, vtable->klass->name, size, max_length);
+		OutputDebugStringA (buf);
+#endif
 		if (G_UNLIKELY (!obj))
 			return NULL;
+#endif
 	} else {
 		obj = (MonoArray *)GC_MALLOC (size);
 		if (G_UNLIKELY (!obj))

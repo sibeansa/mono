@@ -32,6 +32,7 @@
 #	include <gc.h>
 #	include <gc_typed.h>
 #	include <gc_gcj.h>
+#	include <private/gc_pmark.h>
 #else /* HAVE_BDWGC_GC */
 /*Use Mono's Boehm */
 #	ifdef _MSC_VER
